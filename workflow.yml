@@ -1,0 +1,54 @@
+name: Mac Sync
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "jamfScripts/**"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  do_the_thing:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+          fetch-depth: 0
+
+      - name: Make jamfGitSync executable
+        run: chmod +x jamfGitSync.sh
+
+      - name: Install bash 5 + jq
+        run: |
+          brew install bash jq || brew upgrade bash jq
+
+      - name: Run jamfGitSync
+        env:
+          JAMF_URL: ${{ secrets.JAMF_URL }}
+          CLIENT_ID: ${{ secrets.CLIENT_ID }}
+          CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
+          WORKING_DIRECTORY: ${{ github.workspace }}/jamfScripts
+        run: /opt/homebrew/bin/bash ./jamfGitSync.sh
+
+      - name: Commit & push changes (if any)
+        run: |
+          set -e
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add jamfScripts/*.sh
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+
+          git commit -m "Sync missing Jamf scripts from Jamf"
+          git push
