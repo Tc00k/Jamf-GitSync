@@ -1,334 +1,449 @@
 #!/bin/bash
 
-## Created by Trenton Cook
+## Create by Trenton Cook
 ## Created on 2025-12-22
-## Version 1.1
+## Version 1.3 - 2025-12-27
 
-## VARIABLES
+debugMode="false"
 
-## DO NOT CHANGE
-scriptURL="$JAMF_URL/api/v1/scripts"
-startTime=$(date +%s)
-
-## CHANGE IF NEEDED
-debugMode="true"
-
-## FUNCTIONS
-
+## Logging / Debugging
 debug() {
     if [[ "$debugMode" == "true" ]]; then
-        echo $@
+        echo "DEBUG: $@"
     fi
 }
 
-normalizeKey() {
-    echo "$1" | tr '[:upper:]' '[:lower:]' \
-    | tr ' ' '_' \
-    | tr -d '(' \
-    | tr -d ')' \
-    | tr -d '{' \
-    | tr -d '}' \
-    | tr -d '[' \
-    | tr -d ']' \
-    | tr -d '"' \
-    | tr -d "'"
+error() {
+    echo "ERROR: $@"
+    exit 1
 }
 
-normalizeContent() {
-    local contentToNormalize="$1"
-    echo "$contentToNormalize" | tr -d '\r' | sed 's/[[:space:]]*$//'
+warn() {
+    echo "WARNING: $@"
 }
 
-getBearerToken() {
-    local responseBody
-    responseBody=$(curl -s --location --request POST "$JAMF_URL/api/oauth/token" \
+## FUNCTIONS
+preflight() {
+    if [[ ! -d "$WORKING_DIRECTORY" ]]; then
+        warn "Working directory ($WORKING_DIRECTORY) does not exist"
+		mkdir "$WORKING_DIRECTORY"
+    fi
+
+    if [[ -z "$CLIENT_ID" || -z "$CLIENT_SECRET" || -z "$JAMF_URL" ]]; then
+        error "Missing required credentials, are all your GitHub secrets set?"
+    fi
+
+    scriptURL="$JAMF_URL/api/v1/scripts"
+    startTime=$(date +%s)
+}
+
+normalize() {
+    local mode="$1"
+    local content="$2"
+
+    case "$mode" in
+        "content")
+            echo "$content" | tr -d '\r' | sed 's\[[:space:]]*$//' | sed -e :a -e '/^\s*$/d;N;ba'
+        ;;
+        "json")
+            echo "$content" | jq -c 'del(.scriptContents, .id)'
+        ;;
+        "jsonMetadata")
+            echo "$content" | jq 'del(.scriptContents)'
+        ;;
+        "name")
+            echo "$content" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | tr -d '\r' | tr -d '\000' | sed 's/[[:space:]]\+/ /g' | tr '[:upper:]' '[:lower:]'
+        ;;
+    esac
+}
+
+getToken() {
+    local resp
+
+    resp=$(curl -s --location --request POST "$JAMF_URL/api/oauth/token" \
     --header 'Content-Type: application/x-www-form-urlencoded' \
     --data-urlencode "client_id=$CLIENT_ID" \
-    --data-urlencode 'grant_type=client_credentials' \
     --data-urlencode "client_secret=$CLIENT_SECRET" \
+    --data-urlencode "grant_type=client_credentials" \
     )
 
-    bearerToken=$(echo $responseBody | jq -r '.access_token // empty')
+    token=$(echo $resp | jq -r '.access_token // empty')
 
-    if [[ -z "$bearerToken" ]]; then
-        debug "FAILURE: Bearer token could not be retrieved"
-        exit 1
+    if [[ -z "$token" ]]; then
+        error "Bearer token could not be retrieved"
     else
-        debug "Bearer Token retrieved successfully"
+        debug "Bearer token retrieved successfully"
     fi
 }
 
-invalidateToken() {
-    local responseBody
+yeetToken() {
+    local resp
 
-    responseBody=$(curl -w "%{http_code}" -H "Authorization: Bearer ${bearerToken}" $JAMF_URL/api/v1/auth/invalidate-token -X POST -s -o /dev/null)
+    resp=$(curl -w "%{http_code}" -H "Authorization: Bearer ${token}" $JAMF_URL/api/v1/auth/invalidate-token -X POST -s -o /dev/null)
 
-    if [[ ${responseBody} != 204 ]]; then
-        debug "FAILURE: Bearer token could not be invalidated"
-        return 1
+    if [[ ${resp} != 204 ]]; then
+        warn "Bearer token could not be invalidated"
     else
-        debug "Bearer Token invalidated successfully"
+        debug "Bearer token invalidated successfully"
     fi
 
-    bearerToken=""
+    token=""
 }
 
-buildLocalInventory() {
-    declare -gA localInventory
-    debug "-- Building local inventory --"
+parseAllJamfScripts() {
+    parseStart=$(date +%s)
+    if [[ "$parsedAlready" == "true" ]]; then
+        return
+    fi
+    parsedAlready="true"
+    local jsonResponse="$1"
+    declare -gA jamfInventory
+    declare -gA jamfMetadata
+    
+    # Parse each script
+    local resultsCount
+    resultsCount=$(echo "$jsonResponse" | jq '.results | length')
 
-    for script in "$WORKING_DIRECTORY"/*.sh; do
-        [[ -f "$script" ]] || continue
-        localScriptName="$(basename "$script" .sh)"
-        nameKey=$(normalizeKey "$localScriptName")
-        localInventory["$nameKey"]="$script"
+    if [[ -z "$(ls -A "$WORKING_DIRECTORY" 2>/dev/null)" ]]; then
+        newBuild="true"
+    fi
+    
+    for ((i=0; i<resultsCount; i++)); do
+        local script
+        script=$(echo "$jsonResponse" | jq -r ".results[$i]")
+        
+        id=$(echo "$script" | jq -r '.id // ""')
+        name=$(echo "$script" | jq -r '.name // ""')
+        info=$(echo "$script" | jq -r '.info // ""')
+        notes=$(echo "$script" | jq -r '.notes // ""')
+        priority=$(echo "$script" | jq -r '.priority // "AFTER"')
+        
+        param4=$(echo "$script" | jq -r '.parameter4 // ""')
+        param5=$(echo "$script" | jq -r '.parameter5 // ""')
+        param6=$(echo "$script" | jq -r '.parameter6 // ""')
+        param7=$(echo "$script" | jq -r '.parameter7 // ""')
+        param8=$(echo "$script" | jq -r '.parameter8 // ""')
+        param9=$(echo "$script" | jq -r '.parameter9 // ""')
+        param10=$(echo "$script" | jq -r '.parameter10 // ""')
+        param11=$(echo "$script" | jq -r '.parameter11 // ""')
+        
+        osRequirements=$(echo "$script" | jq -r '.osRequirements // ""')
+        scriptContents=$(echo "$script" | jq -r '.scriptContents // ""')
+        categoryId=$(echo "$script" | jq -r '.categoryId // "1"')
+        categoryName=$(echo "$script" | jq -r '.categoryName // ""')
+        
+        if [[ "$newBuild" == "true" ]]; then
+            buildLocalFile
+        fi
+            jamfInventory["$name"]="$scriptContents"
 
-        debug "Added $localScriptName to localInventory"
+            jamfMetadata["$name"]=$(jq -n \
+                --arg id "$id" \
+                --arg name "$name" \
+                --arg info "$info" \
+                --arg notes "$notes" \
+                --arg priority "$priority" \
+                --arg param4 "$param4" \
+                --arg param5 "$param5" \
+                --arg param6 "$param6" \
+                --arg param7 "$param7" \
+                --arg param8 "$param8" \
+                --arg param9 "$param9" \
+                --arg param10 "$param10" \
+                --arg param11 "$param11" \
+                --arg osRequirements "$osRequirements" \
+                --arg scriptContents "$scriptContents" \
+                --arg categoryId "$categoryId" \
+                --arg categoryName "$categoryName" \
+                '{
+                    id: $id,
+                    name: $name,
+                    info: $info,
+                    notes: $notes,
+                    priority: $priority,
+                    parameter4: $param4,
+                    parameter5: $param5,
+                    parameter6: $param6,
+                    parameter7: $param7,
+                    parameter8: $param8,
+                    parameter9: $param9,
+                    parameter10: $param10,
+                    parameter11: $param11,
+                    osRequirements: $osRequirements,
+                    scriptContents: $scriptContents,
+                    categoryId: $categoryId,
+                    categoryName: $categoryName
+                }'
+            )
     done
 
-    debug "-- Local inventory built --"
+    debug "Parsed $resultsCount Jamf scripts in $(($(date +%s) - parseStart)) seconds"
+    newBuild="false"
 }
 
-buildJamfInventory() {
-    declare -gA jamfInventory
-    debug "-- Building Jamf inventory --"
-    debug "-- Retrieving Jamf scripts --"
-    jamfScriptBuild=$(curl -s -H "Authorization: Bearer ${bearerToken}" "$scriptURL?page=0&page-size=2000")
+buildLocalFile() {
+    ## Check for folder
+    if [[ ! -d "$WORKING_DIRECTORY/$name" ]]; then
+        mkdir "$WORKING_DIRECTORY/$name"
+    fi
 
-    while IFS=$'\t' read -r name id; do
-        key=$(normalizeKey "$name")
-        jamfInventory["$key"]="$id"
-        debug "Added $name to jamfInventory"
-    done < <(
-        echo "$jamfScriptBuild" | jq -r '.results[] | "\(.name)\t\(.id)"'
-    )
+    ## Create metadata file
+    jq -n \
+        --arg id "$id" \
+        --arg name "$name" \
+        --arg info "$info" \
+        --arg notes "$notes" \
+        --arg priority "$priority" \
+        --arg param4 "$param4" \
+        --arg param5 "$param5" \
+        --arg param6 "$param6" \
+        --arg param7 "$param7" \
+        --arg param8 "$param8" \
+        --arg param9 "$param9" \
+        --arg param10 "$param10" \
+        --arg param11 "$param11" \
+        --arg osRequirements "$osRequirements" \
+        --arg categoryId "$categoryId" \
+        --arg categoryName "$categoryName" \
+        '{
+            id: $id,
+            name: $name,
+            info: $info,
+            notes: $notes,
+            priority: $priority,
+            parameter4: $param4,
+            parameter5: $param5,
+            parameter6: $param6,
+            parameter7: $param7,
+            parameter8: $param8,
+            parameter9: $param9,
+            parameter10: $param10,
+            parameter11: $param11,
+            osRequirements: $osRequirements,
+            categoryId: $categoryId,
+            categoryName: $categoryName
+        }' > "$WORKING_DIRECTORY/$name/metadata.json"
 
-    debug "-- Jamf inventory built --"
+    ## Create content file
+    echo "$scriptContents" > "$WORKING_DIRECTORY/$name/$name.sh"
 }
 
 compareInventories() {
-    debug "-- Comparing inventories --"
+    declare -gA localInventory
+    declare -gA localMetadata
+    toChange=""
+    toUpload=""
+    toDownload=""
 
-    local changesFound="false"
-    local allKeys=()
+    while IFS= read -r script; do
+        base="${script##*/}"
+        scriptName="${base%.sh}"
 
-    # Collect all keys
-    for k in "${!localInventory[@]}"; do allKeys+=("$k"); done
-    for k in "${!jamfInventory[@]}"; do allKeys+=("$k"); done
-    readarray -t allKeys < <(printf "%s\n" "${allKeys[@]}" | sort -u)
+        content=$(cat "$WORKING_DIRECTORY/${scriptName}/$base")
 
-    for key in "${allKeys[@]}"; do
-        local localVal="${localInventory[$key]:-<missing>}"
-        local jamfVal="${jamfInventory[$key]:-<missing>}"
+        localInventory[${scriptName}]="$content"
+    done < <(
+        find "$WORKING_DIRECTORY" -mindepth 2 -maxdepth 2 -type f -name "*.sh"
+    )
 
-        if [[ "$localVal" == "<missing>" ]]; then
-            echo ""
-            echo "Missing locally: $key"
-            echo "  Jamf ID: $jamfVal"
-            downloadFromJamf "$key"
-            changesFound="true"
-        elif [[ "$jamfVal" == "<missing>" ]]; then
-            echo ""
-            echo "Missing in Jamf: $key"
-            echo "  Local Path: $localVal"
-            uploadToJamf "$key"
-            changesFound="true"
-        else
-            retrieveLocalScriptContent "$key"
-            retrieveJamfScriptContent "$key"
+    while IFS= read -r metadataFile; do
+        dirName="$(basename "$(dirname "$metadataFile")")"
 
-            if [[ "$localScriptContent" != "$jamfScriptContent" ]]; then
-                echo ""
-                echo "Content mismatch: $key"
-                echo "  Local Path: $localVal"
-                echo "  Jamf ID:    $jamfVal"
-                changesFound="true"
+        content=$(<"$metadataFile")
 
-                if [[ "$debugMode" == "true" ]]; then
-                    debug "Would have updated Jamf with local script '$key'"
-                else
-                    updateJamf "$key"
-                fi
+        localMetadata["$dirName"]="$content"
+    done < <(
+        find "$WORKING_DIRECTORY" -mindepth 2 -maxdepth 2 -type f -name "metadata.json"
+    )
+
+    parseAllJamfScripts "$jamfScriptObject"
+
+    for script in "${!jamfInventory[@]}"; do
+        if [[ -v localInventory[$script] ]] || [[ -v localMetadata[$script] ]]; then
+            local localMeta=$(normalize "json" "${localMetadata[$script]}")
+            local jamfMeta=$(normalize "json" "${jamfMetadata[$script]}")
+            if [[ "${localInventory[$script]}" != "${jamfInventory[$script]}" ]] || [[ "$localMeta" != "$jamfMeta" ]]; then
+                debug "Script $script has changed"
+                toChange+=("-- $script\n")
+                toChangeReal+=("$script")
             fi
+        else
+            debug "Script $script does not exist in local"
+            toDownload+=("-- $script\n")
+            toDownloadReal+=("$script")
         fi
     done
 
-    if [[ "$changesFound" != "true" ]]; then
-        echo "No mismatches or missing scripts detected"
+    if [[ -n "${toChange[@]}" ]]; then
+        echo -e "Scripts to update: \n${toChange[@]}"
     fi
 
-    debug "-- Inventory comparison complete --"
+    for script in "${!localInventory[@]}"; do
+        if [[ ! -v jamfInventory[$script] ]]; then
+            debug "Script $script does not exist in Jamf"
+            toUpload+=("-- $script\n")
+            toUploadReal+=("$script")
+        fi
+    done
+
+    if [[ -n "${toUpload[@]}" ]]; then
+        echo -e "Scripts to upload: \n${toUpload[@]}"
+    fi
+
+    if [[ -n "${toDownload[@]}" ]]; then
+        echo -e "Scripts to download: \n${toDownload[@]}"
+    fi
 }
 
-downloadFromJamf() {
-    local key="$1"
-    local scriptID="${jamfInventory[$key]}"
-    local filePath="$WORKING_DIRECTORY/$key.sh"
+applyChanges() {
+    if [[ ${#toChangeReal[@]} != 0 ]]; then
+        for script in "${toChangeReal[@]}"; do
+            local scriptID="$(echo ${jamfMetadata[$script]} | jq -r '.id // ""')"
+            local localPath="$WORKING_DIRECTORY/$script/$script.sh"
+            local scriptContent="$(cat "$localPath")"
+            local escapedContent=$(jq -Rs '.' <<< "$scriptContent")
+            
+            local meta="$(cat "$WORKING_DIRECTORY/$script/metadata.json")"
+            local info=$(echo "$meta" | jq -r '.info // ""')
+            local notes=$(echo "$meta" | jq -r '.notes // ""')
+            local priority=$(echo "$meta" | jq -r '.priority // "AFTER"')
+            local param4=$(echo "$meta" | jq -r '.parameter4 // ""')
+            local param5=$(echo "$meta" | jq -r '.parameter5 // ""')
+            local param6=$(echo "$meta" | jq -r '.parameter6 // ""')
+            local param7=$(echo "$meta" | jq -r '.parameter7 // ""')
+            local param8=$(echo "$meta" | jq -r '.parameter8 // ""')
+            local param9=$(echo "$meta" | jq -r '.parameter9 // ""')
+            local param10=$(echo "$meta" | jq -r '.parameter10 // ""')
+            local param11=$(echo "$meta" | jq -r '.parameter11 // ""')
+            local osRequirements=$(echo "$meta" | jq -r '.osRequirements // ""')
+            local categoryId=$(echo "$meta" | jq -r '.categoryId // "1"')
+            local categoryName=$(echo "$meta" | jq -r '.categoryName // ""')
 
-    if [[ -z "$scriptID" ]]; then
-        debug "Cannot download $key: No Jamf ID found"
-        return 1
-    fi
-
-    if [[ "$debugMode" == "true" ]]; then
-        debug "Would have downloaded script '$key' from Jamf (ID: $scriptID) to $filePath"
-        return 0
-    fi
-
-    debug "Downloading script '$key' from Jamf (ID: $scriptID) to $filePath"
-
-    jamfScriptContent=$(curl -s -H "Authorization: Bearer ${bearerToken}" \
-        "$scriptURL/$scriptID" | jq -r '.scriptContents // empty')
-
-    if [[ -z "$jamfScriptContent" ]]; then
-        echo "Failed to retrieve content for $key from Jamf"
-        return 1
-    fi
-
-    printf "%s\n" "$jamfScriptContent" > "$filePath"
-    echo "Downloaded $key from Jamf to $filePath"
-}
-
-uploadToJamf() {
-    local key="$1"
-    local localPath="${localInventory[$key]}"
-
-    if [[ ! -f "$localPath" ]]; then
-        debug "Cannot upload $key: Local file not found at $localPath"
-        return 1
-    fi
-
-    if [[ "$debugMode" == "true" ]]; then
-        debug "Would have uploaded script '$key' from $localPath to Jamf"
-        return 0
-    fi
-
-    debug "Uploading script '$key' from $localPath to Jamf"
-
-    local localScriptContent
-    localScriptContent=$(cat "$localPath")
-
-    # Escape for JSON
-    local escapedContent
-    escapedContent=$(jq -Rs '.' <<< "$localScriptContent")
-
-    curl -s -X POST "$scriptURL" \
-        -H "Authorization: Bearer ${bearerToken}" \
-        -H "Content-Type: application/json" \
-        -d @- <<-EOF
-    {
-        "name": "$key",
-        "info": "",
-        "notes": "",
-        "priority": "AFTER",
-        "categoryId": "1",
-        "parameter4": "",
-        "parameter5": "",
-        "parameter6": "",
-        "parameter7": "",
-        "parameter8": "",
-        "parameter9": "",
-        "parameter10": "",
-        "parameter11": "",
-        "osRequirements": "",
-        "scriptContents": $escapedContent
-    }
+            curl -s -X PUT "$scriptURL/$scriptID" \
+                -H "Authorization: Bearer ${token}" \
+                -H "Content-Type: application/json" \
+                -d @-<<-EOF >/dev/null 2>&1
+            {
+                "name": "$script",
+                "info": "$info",
+                "notes": "$notes",
+                "priority": "$priority",
+                "categoryId": "$categoryId",
+                "parameter4": "$param4",
+                "parameter5": "$param5",
+                "parameter6": "$param6",
+                "parameter7": "$param7",
+                "parameter8": "$param8",
+                "parameter9": "$param9",
+                "parameter10": "$param10",
+                "parameter11": "$param11",
+                "osRequirements": "$osRequirements",
+                "scriptContents": $escapedContent
+            }
 	EOF
-
-    echo "Uploaded $key from $localPath to Jamf"
-}
-
-updateJamf() {
-    local key="$1"
-    local scriptID="${jamfInventory[$key]}"
-    local localPath="${localInventory[$key]}"
-
-    if [[ -z "$scriptID" ]]; then
-        debug "Cannot update $key: Jamf ID not found"
-        return 1
+        done
     fi
 
-    if [[ ! -f "$localPath" ]]; then
-        debug "Cannot update $key: Local file not found at $localPath"
-        return 1
+    if [[ ${#toDownloadReal[@]} != 0 ]]; then
+        for script in "${toDownloadReal[@]}"; do
+            local scriptContent=$(echo "${jamfInventory[$script]}")
+            local metaContent=$(echo "${jamfMetadata[$script]}")
+            metaContent=$(normalize "jsonMetadata" "$metaContent")
+            local filePath="$WORKING_DIRECTORY/$script/$script.sh"
+            local directoryPath="$WORKING_DIRECTORY/$script"
+            local metadataPath="$WORKING_DIRECTORY/$script/metadata.json"
+
+            if [[ ! -d "$directoryPath" ]]; then
+                mkdir "$directoryPath"
+            fi
+
+            echo "$scriptContent" > "$filePath"
+            echo "$metaContent" > "$metadataPath"
+        done
     fi
 
-    local localScriptContent
-    localScriptContent=$(cat "$localPath")
-    localScriptContent=$(normalizeContent "$localScriptContent")
+    if [[ ${#toUploadReal[@]} != 0 ]]; then
+        for script in "${toUploadReal[@]}"; do
+            local scriptContent=$(echo "${localInventory[$script]}")
+            local metaContent=$(echo "${localMetadata[$script]}")
+            local escapedContent=$(jq -Rs '.' <<< "$scriptContent")
 
-    local escapedContent
-    escapedContent=$(jq -Rs '.' <<< "$localScriptContent")
+            local info=$(echo "$metaContent" | jq -r '.info // ""')
+            local notes=$(echo "$metaContent" | jq -r '.notes // ""')
+            local priority=$(echo "$metaContent" | jq -r '.priority // "AFTER"')
+            local param4=$(echo "$metaContent" | jq -r '.parameter4 // ""')
+            local param5=$(echo "$metaContent" | jq -r '.parameter5 // ""')
+            local param6=$(echo "$metaContent" | jq -r '.parameter6 // ""')
+            local param7=$(echo "$metaContent" | jq -r '.parameter7 // ""')
+            local param8=$(echo "$metaContent" | jq -r '.parameter8 // ""')
+            local param9=$(echo "$metaContent" | jq -r '.parameter9 // ""')
+            local param10=$(echo "$metaContent" | jq -r '.parameter10 // ""')
+            local param11=$(echo "$metaContent" | jq -r '.parameter11 // ""')
+            local osRequirements=$(echo "$metaContent" | jq -r '.osRequirements // ""')
+            local categoryId=$(echo "$metaContent" | jq -r '.categoryId // "1"')
+            local categoryName=$(echo "$metaContent" | jq -r '.categoryName // ""')
+            
+            if [[ -z "$scriptContent" ]]; then
+                warn "Content for $script is empty, did you mean to upload this?"
+            fi
 
-    if [[ "$debugMode" == "true" ]]; then
-        debug "Would have updated Jamf script '$key' (ID: $scriptID) from $localPath"
-        return 0
-    fi
+            if [[ -z "$metaContent" ]]; then
+                warn "Metadata for $script is empty, did you mean to upload this?"
+            fi
 
-    curl -s -X PUT "$scriptURL/$scriptID" \
-        -H "Authorization: Bearer ${bearerToken}" \
-        -H "Content-Type: application/json" \
-        -d @- <<-EOF
-    {
-        "name": "$key",
-        "info": "",
-        "notes": "",
-        "priority": "AFTER",
-        "categoryId": "1",
-        "parameter4": "",
-        "parameter5": "",
-        "parameter6": "",
-        "parameter7": "",
-        "parameter8": "",
-        "parameter9": "",
-        "parameter10": "",
-        "parameter11": "",
-        "osRequirements": "",
-        "scriptContents": $escapedContent
-    }
+            resp=$(curl -s -X POST "$scriptURL" \
+                -H "Authorization: Bearer ${token}" \
+                -H "Content-Type: application/json" \
+                -d @- <<-EOF
+            {
+                "name": "$script",
+                "info": "$info",
+                "notes": "$notes",
+                "priority": "$priority",
+                "categoryId": "$categoryId",
+                "parameter4": "$param4",
+                "parameter5": "$param5",
+                "parameter6": "$param6",
+                "parameter7": "$param7",
+                "parameter8": "$param8",
+                "parameter9": "$param9",
+                "parameter10": "$param10",
+                "parameter11": "$param11",
+                "osRequirements": "$osRequirements",
+                "scriptContents": $escapedContent
+            }
 	EOF
+            )
 
-    echo "Updated Jamf script '$key' (ID: $scriptID) from $localPath"
-}
-
-retrieveLocalScriptContent() {
-    local key="$1"
-    local localScriptPath="$WORKING_DIRECTORY/$key.sh"
-
-    if [[ ! -f "$localScriptPath" ]]; then
-        debug "Local script not found for key: $key"
-        localScriptContent=""
-        return 1
+            local scriptID=$(echo "$resp" | jq -r '.id // ""')
+            local tempFile="$WORKING_DIRECTORY/$script/metadataTemp.json"
+            local metadataPath="$WORKING_DIRECTORY/$script/metadata.json"
+            jq --arg id "$scriptID" '.id = $id' "$metadataPath" > "$tempFile"
+            mv "$tempFile" "$metadataPath"
+        done
     fi
-
-    localScriptContent=$(<"$localScriptPath")
-    localScriptContent=$(normalizeContent "$localScriptContent")
 }
 
-retrieveJamfScriptContent() {
-    local key="$1"
-    local script_ID="${jamfInventory[$key]:-}"
-
-    if [[ -z "$script_ID" ]]; then
-        debug "WARN: No Jamf ID found for key '$key'"
-        jamfScriptContent=""
-        return 1
-    fi
-
-    jamfScriptContent=$(echo "$jamfScriptBuild" | \
-        jq -r --arg id "$script_ID" '.results[] | select(.id | tostring == $id) | .scriptContents // empty')
-
-    jamfScriptContent=$(normalizeContent "$jamfScriptContent")
-
-    scriptID="$script_ID"
-}
-
-getBearerToken
-buildLocalInventory
-buildJamfInventory
+## Main Runtime
+preflight
+getToken
+jamfScriptObject=$(curl -s -H "Authorization: Bearer ${token}" "$scriptURL?page=0&page-size=2000")
+if [[ -z "$(ls -A "$WORKING_DIRECTORY" 2>/dev/null)" ]]; then
+    parseAllJamfScripts "$jamfScriptObject"
+else
+    debug "Local scripts already exist"
+fi
 compareInventories
-invalidateToken
+if [[ ( ${#toDownload[@]} != 1 || ${#toUpload[@]} != 1 || ${#toChange[@]} != 1 ) && "$debugMode" == "false" ]]; then
+    echo "Applying queued changes"
+    if [[ "$debugMode" == "true" ]]; then
+        debug "Would have applied queued changes"
+    else
+        applyChanges
+    fi
+else
+    echo "No changes to apply, cleaning up..."
+fi
+yeetToken
 
-endTime=$(date +%s)
-timeDiff=$(($endTime - $startTime))
-echo "Total time: $timeDiff seconds"
+echo "Completed in $(( $(date +%s) - $startTime )) seconds"
